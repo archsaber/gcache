@@ -2,7 +2,7 @@ package gcache
 
 import (
 	"errors"
-	"github.com/bluele/gcache/singleflight"
+	"github.com/archsaber/gcache/singleflight"
 	"sync"
 	"time"
 )

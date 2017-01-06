@@ -2,7 +2,6 @@ package gcache
 
 import (
 	"errors"
-	"github.com/archsaber/gcache/singleflight"
 	"sync"
 	"time"
 )
@@ -14,16 +13,20 @@ const (
 	TYPE_ARC    = "arc"
 )
 
-var NotFoundKeyError = errors.New("Not found error.")
+var KeyNotFoundError = errors.New("Key not found.")
 
 type Cache interface {
 	Set(interface{}, interface{})
 	Get(interface{}) (interface{}, error)
+	GetIFPresent(interface{}) (interface{}, error)
+	GetALL() map[interface{}]interface{}
+	get(interface{}, bool) (interface{}, error)
 	Remove(interface{}) bool
 	Purge()
 	Keys() []interface{}
 	Len() int
-	gc()
+
+	statsAccessor
 }
 
 type baseCache struct {
@@ -33,7 +36,8 @@ type baseCache struct {
 	addedFunc   *AddedFunc
 	expiration  *time.Duration
 	mu          sync.RWMutex
-	loadGroup   singleflight.Group
+	loadGroup   Group
+	*stats
 }
 
 type LoaderFunc func(interface{}) (interface{}, error)
@@ -49,7 +53,6 @@ type CacheBuilder struct {
 	evictedFunc *EvictedFunc
 	addedFunc   *AddedFunc
 	expiration  *time.Duration
-	gcInterval  *time.Duration
 }
 
 func New(size int) *CacheBuilder {
@@ -62,13 +65,10 @@ func New(size int) *CacheBuilder {
 	}
 }
 
+// Set a loader function.
+// loaderFunc: create a new value with this function if cached value is expired.
 func (cb *CacheBuilder) LoaderFunc(loaderFunc LoaderFunc) *CacheBuilder {
 	cb.loaderFunc = &loaderFunc
-	return cb
-}
-
-func (cb *CacheBuilder) EnableGC(interval time.Duration) *CacheBuilder {
-	cb.gcInterval = &interval
 	return cb
 }
 
@@ -109,20 +109,7 @@ func (cb *CacheBuilder) Expiration(expiration time.Duration) *CacheBuilder {
 }
 
 func (cb *CacheBuilder) Build() Cache {
-	cache := cb.build()
-	if cb.gcInterval != nil {
-		go func() {
-			t := time.NewTicker(*cb.gcInterval)
-			for {
-				select {
-				case <-t.C:
-					go cache.gc()
-				}
-			}
-			t.Stop()
-		}()
-	}
-	return cache
+	return cb.build()
 }
 
 func (cb *CacheBuilder) build() Cache {
@@ -146,15 +133,16 @@ func buildCache(c *baseCache, cb *CacheBuilder) {
 	c.expiration = cb.expiration
 	c.addedFunc = cb.addedFunc
 	c.evictedFunc = cb.evictedFunc
+	c.stats = &stats{}
 }
 
 // load a new value using by specified key.
-func (c *baseCache) load(key interface{}, cb func(interface{}, error) (interface{}, error)) (interface{}, error) {
-	v, err := c.loadGroup.Do(key, func() (interface{}, error) {
+func (c *baseCache) load(key interface{}, cb func(interface{}, error) (interface{}, error), isWait bool) (interface{}, bool, error) {
+	v, called, err := c.loadGroup.Do(key, func() (interface{}, error) {
 		return cb((*c.loaderFunc)(key))
-	})
+	}, isWait)
 	if err != nil {
-		return nil, err
+		return nil, called, err
 	}
-	return v, nil
+	return v, called, nil
 }

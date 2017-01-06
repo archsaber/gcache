@@ -18,15 +18,20 @@ type ARC struct {
 }
 
 func newARC(cb *CacheBuilder) *ARC {
-	c := &ARC{
-		items: make(map[interface{}]*arcItem),
-		t1:    newARCList(),
-		t2:    newARCList(),
-		b1:    newARCList(),
-		b2:    newARCList(),
-	}
+	c := &ARC{}
 	buildCache(&c.baseCache, cb)
+
+	c.init()
+	c.loadGroup.cache = c
 	return c
+}
+
+func (c *ARC) init() {
+	c.items = make(map[interface{}]*arcItem)
+	c.t1 = newARCList()
+	c.t2 = newARCList()
+	c.b1 = newARCList()
+	c.b2 = newARCList()
 }
 
 func (c *ARC) replace(key interface{}) {
@@ -34,15 +39,17 @@ func (c *ARC) replace(key interface{}) {
 	if (c.t1.Len() > 0 && c.b2.Has(key) && c.t1.Len() == c.part) || (c.t1.Len() > c.part) {
 		old = c.t1.RemoveTail()
 		c.b1.PushFront(old)
-	} else {
+	} else if c.t2.l.Len() > 0 {
 		old = c.t2.RemoveTail()
 		c.b2.PushFront(old)
+	} else {
+		return
 	}
 	item, ok := c.items[old]
 	if ok {
 		delete(c.items, old)
 		if c.evictedFunc != nil {
-			go (*c.evictedFunc)(item.key, item.value)
+			(*c.evictedFunc)(item.key, item.value)
 		}
 	}
 }
@@ -96,7 +103,7 @@ func (c *ARC) set(key, value interface{}) (interface{}, error) {
 			if ok {
 				delete(c.items, pop)
 				if c.evictedFunc != nil {
-					go (*c.evictedFunc)(item.key, item.value)
+					(*c.evictedFunc)(item.key, item.value)
 				}
 			}
 		}
@@ -113,7 +120,7 @@ func (c *ARC) set(key, value interface{}) (interface{}, error) {
 	c.t1.PushFront(key)
 
 	if c.addedFunc != nil {
-		go (*c.addedFunc)(key, value)
+		(*c.addedFunc)(key, value)
 	}
 
 	return item, nil
@@ -121,6 +128,25 @@ func (c *ARC) set(key, value interface{}) (interface{}, error) {
 
 // Get a value from cache pool using key if it exists. If not exists and it has LoaderFunc, it will generate the value using you have specified LoaderFunc method returns value.
 func (c *ARC) Get(key interface{}) (interface{}, error) {
+	v, err := c.getValue(key)
+	if err != nil {
+		return c.getWithLoader(key, true)
+	}
+	return v, nil
+}
+
+// Get a value from cache pool using key if it exists.
+// If it dose not exists key, returns KeyNotFoundError.
+// And send a request which refresh value for specified key if cache object has LoaderFunc.
+func (c *ARC) GetIFPresent(key interface{}) (interface{}, error) {
+	v, err := c.getValue(key)
+	if err != nil {
+		return c.getWithLoader(key, false)
+	}
+	return v, nil
+}
+
+func (c *ARC) get(key interface{}, onLoad bool) (interface{}, error) {
 	rl := false
 	c.mu.RLock()
 	if elt := c.t1.Lookup(key); elt != nil {
@@ -132,11 +158,15 @@ func (c *ARC) Get(key interface{}) (interface{}, error) {
 		if !item.IsExpired(nil) {
 			c.t2.PushFront(key)
 			c.mu.Unlock()
-			return item.value, nil
+			if !onLoad {
+				c.stats.IncrHitCount()
+			}
+			return item, nil
 		}
 		c.b2.PushFront(key)
+		delete(c.items, key)
 		if c.evictedFunc != nil {
-			go (*c.evictedFunc)(key, elt.Value)
+			(*c.evictedFunc)(key, elt.Value)
 		}
 		c.mu.Unlock()
 	}
@@ -148,12 +178,16 @@ func (c *ARC) Get(key interface{}) (interface{}, error) {
 		if !item.IsExpired(nil) {
 			c.t2.MoveToFront(elt)
 			c.mu.Unlock()
-			return item.value, nil
+			if !onLoad {
+				c.stats.IncrHitCount()
+			}
+			return item, nil
 		}
 		c.t2.Remove(key, elt)
 		c.b2.PushFront(key)
+		delete(c.items, key)
 		if c.evictedFunc != nil {
-			go (*c.evictedFunc)(key, elt.Value)
+			(*c.evictedFunc)(key, elt.Value)
 		}
 		c.mu.Unlock()
 	}
@@ -161,19 +195,32 @@ func (c *ARC) Get(key interface{}) (interface{}, error) {
 	if !rl {
 		c.mu.RUnlock()
 	}
-
-	if c.loaderFunc == nil {
-		return nil, NotFoundKeyError
+	if !onLoad {
+		c.stats.IncrMissCount()
 	}
+	return nil, KeyNotFoundError
+}
 
-	item, err := c.load(key, func(v interface{}, e error) (interface{}, error) {
+func (c *ARC) getValue(key interface{}) (interface{}, error) {
+	it, err := c.get(key, false)
+	if err != nil {
+		return nil, err
+	}
+	return it.(*arcItem).value, nil
+}
+
+func (c *ARC) getWithLoader(key interface{}, isWait bool) (interface{}, error) {
+	if c.loaderFunc == nil {
+		return nil, KeyNotFoundError
+	}
+	item, _, err := c.load(key, func(v interface{}, e error) (interface{}, error) {
 		if e == nil {
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			return c.set(key, v)
 		}
 		return nil, e
-	})
+	}, isWait)
 	if err != nil {
 		return nil, err
 	}
@@ -193,7 +240,7 @@ func (c *ARC) remove(key interface{}) bool {
 		v := elt.Value.(*arcItem).value
 		c.t1.Remove(key, elt)
 		if c.evictedFunc != nil {
-			go (*c.evictedFunc)(key, v)
+			(*c.evictedFunc)(key, v)
 		}
 		return true
 	}
@@ -202,7 +249,7 @@ func (c *ARC) remove(key interface{}) bool {
 		v := elt.Value.(*arcItem).value
 		c.t2.Remove(key, elt)
 		if c.evictedFunc != nil {
-			go (*c.evictedFunc)(key, v)
+			(*c.evictedFunc)(key, v)
 		}
 		return true
 	}
@@ -210,24 +257,45 @@ func (c *ARC) remove(key interface{}) bool {
 	return false
 }
 
-// Keys returns a slice of the keys in the cache.
-func (c *ARC) Keys() []interface{} {
+func (c *ARC) keys() []interface{} {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-
-	keys := []interface{}{}
-	for key := range c.items {
-		keys = append(keys, key)
+	keys := make([]interface{}, len(c.items))
+	var i = 0
+	for k := range c.items {
+		keys[i] = k
+		i++
 	}
 	return keys
 }
 
+// Keys returns a slice of the keys in the cache.
+func (c *ARC) Keys() []interface{} {
+	keys := []interface{}{}
+	for _, k := range c.keys() {
+		_, err := c.GetIFPresent(k)
+		if err == nil {
+			keys = append(keys, k)
+		}
+	}
+	return keys
+}
+
+// Returns all key-value pairs in the cache.
+func (c *ARC) GetALL() map[interface{}]interface{} {
+	m := make(map[interface{}]interface{})
+	for _, k := range c.keys() {
+		v, err := c.GetIFPresent(k)
+		if err == nil {
+			m[k] = v
+		}
+	}
+	return m
+}
+
 // Len returns the number of items in the cache.
 func (c *ARC) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	return len(c.items)
+	return len(c.GetALL())
 }
 
 // Purge is used to completely clear the cache
@@ -235,31 +303,7 @@ func (c *ARC) Purge() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.items = make(map[interface{}]*arcItem)
-	c.t1 = newARCList()
-	c.t2 = newARCList()
-	c.b1 = newARCList()
-	c.b2 = newARCList()
-}
-
-func (c *ARC) gc() {
-	now := time.Now()
-	keys := []interface{}{}
-	c.mu.RLock()
-	for k, item := range c.items {
-		if item.IsExpired(&now) {
-			keys = append(keys, k)
-		}
-	}
-	c.mu.RUnlock()
-	if len(keys) == 0 {
-		return
-	}
-	c.mu.Lock()
-	for _, k := range keys {
-		c.remove(k)
-	}
-	c.mu.Unlock()
+	c.init()
 }
 
 // returns boolean value whether this item is expired or not.

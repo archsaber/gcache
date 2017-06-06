@@ -16,7 +16,8 @@ const (
 var KeyNotFoundError = errors.New("Key not found.")
 
 type Cache interface {
-	Set(interface{}, interface{})
+	Set(interface{}, interface{}) error
+	SetWithExpire(interface{}, interface{}, time.Duration) error
 	Get(interface{}) (interface{}, error)
 	GetIFPresent(interface{}) (interface{}, error)
 	GetALL() map[interface{}]interface{}
@@ -30,29 +31,36 @@ type Cache interface {
 }
 
 type baseCache struct {
-	size        int
-	loaderFunc  *LoaderFunc
-	evictedFunc *EvictedFunc
-	addedFunc   *AddedFunc
-	expiration  *time.Duration
-	mu          sync.RWMutex
-	loadGroup   Group
+	size             int
+	loaderExpireFunc LoaderExpireFunc
+	evictedFunc      EvictedFunc
+	addedFunc        AddedFunc
+	deserializeFunc  DeserializeFunc
+	serializeFunc    SerializeFunc
+	expiration       *time.Duration
+	mu               sync.RWMutex
+	loadGroup        Group
 	*stats
 }
 
-type LoaderFunc func(interface{}) (interface{}, error)
-
-type EvictedFunc func(interface{}, interface{})
-
-type AddedFunc func(interface{}, interface{})
+type (
+	LoaderFunc       func(interface{}) (interface{}, error)
+	LoaderExpireFunc func(interface{}) (interface{}, *time.Duration, error)
+	EvictedFunc      func(interface{}, interface{})
+	AddedFunc        func(interface{}, interface{})
+	DeserializeFunc  func(interface{}, interface{}) (interface{}, error)
+	SerializeFunc    func(interface{}, interface{}) (interface{}, error)
+)
 
 type CacheBuilder struct {
-	tp          string
-	size        int
-	loaderFunc  *LoaderFunc
-	evictedFunc *EvictedFunc
-	addedFunc   *AddedFunc
-	expiration  *time.Duration
+	tp               string
+	size             int
+	loaderExpireFunc LoaderExpireFunc
+	evictedFunc      EvictedFunc
+	addedFunc        AddedFunc
+	expiration       *time.Duration
+	deserializeFunc  DeserializeFunc
+	serializeFunc    SerializeFunc
 }
 
 func New(size int) *CacheBuilder {
@@ -68,7 +76,18 @@ func New(size int) *CacheBuilder {
 // Set a loader function.
 // loaderFunc: create a new value with this function if cached value is expired.
 func (cb *CacheBuilder) LoaderFunc(loaderFunc LoaderFunc) *CacheBuilder {
-	cb.loaderFunc = &loaderFunc
+	cb.loaderExpireFunc = func(k interface{}) (interface{}, *time.Duration, error) {
+		v, err := loaderFunc(k)
+		return v, nil, err
+	}
+	return cb
+}
+
+// Set a loader function with expiration.
+// loaderExpireFunc: create a new value with this function if cached value is expired.
+// If nil returned instead of time.Duration from loaderExpireFunc than value will never expire.
+func (cb *CacheBuilder) LoaderExpireFunc(loaderExpireFunc LoaderExpireFunc) *CacheBuilder {
+	cb.loaderExpireFunc = loaderExpireFunc
 	return cb
 }
 
@@ -94,12 +113,22 @@ func (cb *CacheBuilder) ARC() *CacheBuilder {
 }
 
 func (cb *CacheBuilder) EvictedFunc(evictedFunc EvictedFunc) *CacheBuilder {
-	cb.evictedFunc = &evictedFunc
+	cb.evictedFunc = evictedFunc
 	return cb
 }
 
 func (cb *CacheBuilder) AddedFunc(addedFunc AddedFunc) *CacheBuilder {
-	cb.addedFunc = &addedFunc
+	cb.addedFunc = addedFunc
+	return cb
+}
+
+func (cb *CacheBuilder) DeserializeFunc(deserializeFunc DeserializeFunc) *CacheBuilder {
+	cb.deserializeFunc = deserializeFunc
+	return cb
+}
+
+func (cb *CacheBuilder) SerializeFunc(serializeFunc SerializeFunc) *CacheBuilder {
+	cb.serializeFunc = serializeFunc
 	return cb
 }
 
@@ -129,17 +158,19 @@ func (cb *CacheBuilder) build() Cache {
 
 func buildCache(c *baseCache, cb *CacheBuilder) {
 	c.size = cb.size
-	c.loaderFunc = cb.loaderFunc
+	c.loaderExpireFunc = cb.loaderExpireFunc
 	c.expiration = cb.expiration
 	c.addedFunc = cb.addedFunc
+	c.deserializeFunc = cb.deserializeFunc
+	c.serializeFunc = cb.serializeFunc
 	c.evictedFunc = cb.evictedFunc
 	c.stats = &stats{}
 }
 
 // load a new value using by specified key.
-func (c *baseCache) load(key interface{}, cb func(interface{}, error) (interface{}, error), isWait bool) (interface{}, bool, error) {
+func (c *baseCache) load(key interface{}, cb func(interface{}, *time.Duration, error) (interface{}, error), isWait bool) (interface{}, bool, error) {
 	v, called, err := c.loadGroup.Do(key, func() (interface{}, error) {
-		return cb((*c.loaderFunc)(key))
+		return cb(c.loaderExpireFunc(key))
 	}, isWait)
 	if err != nil {
 		return nil, called, err

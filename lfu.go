@@ -30,14 +30,37 @@ func (c *LFUCache) init() {
 	})
 }
 
-// set a new key-value pair
-func (c *LFUCache) Set(key, value interface{}) {
+// Set a new key-value pair
+func (c *LFUCache) Set(key, value interface{}) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.set(key, value)
+	_, err := c.set(key, value)
+	return err
+}
+
+// Set a new key-value pair with an expiration time
+func (c *LFUCache) SetWithExpire(key, value interface{}, expiration time.Duration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	item, err := c.set(key, value)
+	if err != nil {
+		return err
+	}
+
+	t := time.Now().Add(expiration)
+	item.(*lfuItem).expiration = &t
+	return nil
 }
 
 func (c *LFUCache) set(key, value interface{}) (interface{}, error) {
+	var err error
+	if c.serializeFunc != nil {
+		value, err = c.serializeFunc(key, value)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// Check for existing item
 	item, ok := c.items[key]
 	if ok {
@@ -66,7 +89,7 @@ func (c *LFUCache) set(key, value interface{}) (interface{}, error) {
 	}
 
 	if c.addedFunc != nil {
-		(*c.addedFunc)(key, value)
+		c.addedFunc(key, value)
 	}
 
 	return item, nil
@@ -76,79 +99,81 @@ func (c *LFUCache) set(key, value interface{}) (interface{}, error) {
 // If it dose not exists key and has LoaderFunc,
 // generate a value using `LoaderFunc` method returns value.
 func (c *LFUCache) Get(key interface{}) (interface{}, error) {
-	v, err := c.getValue(key)
-	if err != nil {
+	v, err := c.get(key, false)
+	if err == KeyNotFoundError {
 		return c.getWithLoader(key, true)
 	}
-	return v, nil
+	return v, err
 }
 
 // Get a value from cache pool using key if it exists.
 // If it dose not exists key, returns KeyNotFoundError.
 // And send a request which refresh value for specified key if cache object has LoaderFunc.
 func (c *LFUCache) GetIFPresent(key interface{}) (interface{}, error) {
-	v, err := c.getValue(key)
-	if err != nil {
+	v, err := c.get(key, false)
+	if err == KeyNotFoundError {
 		return c.getWithLoader(key, false)
+	}
+	return v, err
+}
+
+func (c *LFUCache) get(key interface{}, onLoad bool) (interface{}, error) {
+	v, err := c.getValue(key, onLoad)
+	if err != nil {
+		return nil, err
+	}
+	if c.deserializeFunc != nil {
+		return c.deserializeFunc(key, v)
 	}
 	return v, nil
 }
 
-func (c *LFUCache) get(key interface{}, onLoad bool) (interface{}, error) {
-	c.mu.RLock()
+func (c *LFUCache) getValue(key interface{}, onLoad bool) (interface{}, error) {
+	c.mu.Lock()
 	item, ok := c.items[key]
-	c.mu.RUnlock()
-
 	if ok {
 		if !item.IsExpired(nil) {
-			c.mu.Lock()
 			c.increment(item)
+			v := item.value
 			c.mu.Unlock()
 			if !onLoad {
 				c.stats.IncrHitCount()
 			}
-			return item, nil
+			return v, nil
 		}
-		c.mu.Lock()
 		c.removeItem(item)
-		c.mu.Unlock()
 	}
+	c.mu.Unlock()
 	if !onLoad {
 		c.stats.IncrMissCount()
 	}
 	return nil, KeyNotFoundError
 }
 
-func (c *LFUCache) getValue(key interface{}) (interface{}, error) {
-	it, err := c.get(key, false)
-	if err != nil {
-		return nil, err
-	}
-	return it.(*lfuItem).value, nil
-}
-
 func (c *LFUCache) getWithLoader(key interface{}, isWait bool) (interface{}, error) {
-	if c.loaderFunc == nil {
+	if c.loaderExpireFunc == nil {
 		return nil, KeyNotFoundError
 	}
-	it, called, err := c.load(key, func(v interface{}, e error) (interface{}, error) {
-		if e == nil {
-			c.mu.Lock()
-			defer c.mu.Unlock()
-			return c.set(key, v)
+	value, _, err := c.load(key, func(v interface{}, expiration *time.Duration, e error) (interface{}, error) {
+		if e != nil {
+			return nil, e
 		}
-		return nil, e
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		item, err := c.set(key, v)
+		if err != nil {
+			return nil, err
+		}
+		if expiration != nil {
+			t := time.Now().Add(*expiration)
+			item.(*lfuItem).expiration = &t
+		}
+		return v, nil
 	}, isWait)
 	if err != nil {
 		return nil, err
 	}
-	li := it.(*lfuItem)
-	if !called {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		c.increment(li)
-	}
-	return li.value, nil
+	return value, nil
 }
 
 func (c *LFUCache) increment(item *lfuItem) {
@@ -208,7 +233,7 @@ func (c *LFUCache) removeItem(item *lfuItem) {
 	delete(c.items, item.key)
 	delete(item.freqElement.Value.(*freqEntry).items, item)
 	if c.evictedFunc != nil {
-		(*c.evictedFunc)(item.key, item.value)
+		c.evictedFunc(item.key, item.value)
 	}
 }
 

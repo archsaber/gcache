@@ -27,6 +27,14 @@ func (c *LRUCache) init() {
 }
 
 func (c *LRUCache) set(key, value interface{}) (interface{}, error) {
+	var err error
+	if c.serializeFunc != nil {
+		value, err = c.serializeFunc(key, value)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// Check for existing item
 	var item *lruItem
 	if it, ok := c.items[key]; ok {
@@ -51,91 +59,114 @@ func (c *LRUCache) set(key, value interface{}) (interface{}, error) {
 	}
 
 	if c.addedFunc != nil {
-		(*c.addedFunc)(key, value)
+		c.addedFunc(key, value)
 	}
 
 	return item, nil
 }
 
 // set a new key-value pair
-func (c *LRUCache) Set(key, value interface{}) {
+func (c *LRUCache) Set(key, value interface{}) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.set(key, value)
+	_, err := c.set(key, value)
+	return err
+}
+
+// Set a new key-value pair with an expiration time
+func (c *LRUCache) SetWithExpire(key, value interface{}, expiration time.Duration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	item, err := c.set(key, value)
+	if err != nil {
+		return err
+	}
+
+	t := time.Now().Add(expiration)
+	item.(*lruItem).expiration = &t
+	return nil
 }
 
 // Get a value from cache pool using key if it exists.
 // If it dose not exists key and has LoaderFunc,
 // generate a value using `LoaderFunc` method returns value.
 func (c *LRUCache) Get(key interface{}) (interface{}, error) {
-	v, err := c.getValue(key)
-	if err != nil {
+	v, err := c.get(key, false)
+	if err == KeyNotFoundError {
 		return c.getWithLoader(key, true)
 	}
-	return v, nil
+	return v, err
 }
 
 // Get a value from cache pool using key if it exists.
 // If it dose not exists key, returns KeyNotFoundError.
 // And send a request which refresh value for specified key if cache object has LoaderFunc.
 func (c *LRUCache) GetIFPresent(key interface{}) (interface{}, error) {
-	v, err := c.getValue(key)
-	if err != nil {
+	v, err := c.get(key, false)
+	if err == KeyNotFoundError {
 		return c.getWithLoader(key, false)
+	}
+	return v, err
+}
+
+func (c *LRUCache) get(key interface{}, onLoad bool) (interface{}, error) {
+	v, err := c.getValue(key, onLoad)
+	if err != nil {
+		return nil, err
+	}
+	if c.deserializeFunc != nil {
+		return c.deserializeFunc(key, v)
 	}
 	return v, nil
 }
 
-func (c *LRUCache) get(key interface{}, onLoad bool) (interface{}, error) {
-	c.mu.RLock()
+func (c *LRUCache) getValue(key interface{}, onLoad bool) (interface{}, error) {
+	c.mu.Lock()
 	item, ok := c.items[key]
-	c.mu.RUnlock()
-
 	if ok {
 		it := item.Value.(*lruItem)
 		if !it.IsExpired(nil) {
-			c.mu.Lock()
-			defer c.mu.Unlock()
 			c.evictList.MoveToFront(item)
+			v := it.value
+			c.mu.Unlock()
 			if !onLoad {
 				c.stats.IncrHitCount()
 			}
-			return it, nil
+			return v, nil
 		}
-		c.mu.Lock()
 		c.removeElement(item)
-		c.mu.Unlock()
 	}
+	c.mu.Unlock()
 	if !onLoad {
 		c.stats.IncrMissCount()
 	}
 	return nil, KeyNotFoundError
 }
 
-func (c *LRUCache) getValue(key interface{}) (interface{}, error) {
-	it, err := c.get(key, false)
-	if err != nil {
-		return nil, err
-	}
-	return it.(*lruItem).value, nil
-}
-
 func (c *LRUCache) getWithLoader(key interface{}, isWait bool) (interface{}, error) {
-	if c.loaderFunc == nil {
+	if c.loaderExpireFunc == nil {
 		return nil, KeyNotFoundError
 	}
-	it, _, err := c.load(key, func(v interface{}, e error) (interface{}, error) {
-		if e == nil {
-			c.mu.Lock()
-			defer c.mu.Unlock()
-			return c.set(key, v)
+	value, _, err := c.load(key, func(v interface{}, expiration *time.Duration, e error) (interface{}, error) {
+		if e != nil {
+			return nil, e
 		}
-		return nil, e
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		item, err := c.set(key, v)
+		if err != nil {
+			return nil, err
+		}
+		if expiration != nil {
+			t := time.Now().Add(*expiration)
+			item.(*lruItem).expiration = &t
+		}
+		return v, nil
 	}, isWait)
 	if err != nil {
 		return nil, err
 	}
-	return it.(*lruItem).value, nil
+	return value, nil
 }
 
 // evict removes the oldest item from the cache.
@@ -172,7 +203,7 @@ func (c *LRUCache) removeElement(e *list.Element) {
 	delete(c.items, entry.key)
 	if c.evictedFunc != nil {
 		entry := e.Value.(*lruItem)
-		(*c.evictedFunc)(entry.key, entry.value)
+		c.evictedFunc(entry.key, entry.value)
 	}
 }
 
